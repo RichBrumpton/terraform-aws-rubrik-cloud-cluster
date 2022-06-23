@@ -2,12 +2,13 @@
 # Dynamic Variable Creation #
 #############################
 locals {
-  cluster_name       = var.environment == "" ? var.cluster_name : "${var.environment}.${var.cluster_name}"
-  cluster_node_names = formatlist("${local.cluster_name}-%02s", range(1, var.number_of_nodes + 1))
+  cluster_node_names = formatlist("${var.cluster_name}-%02s", range(1, var.number_of_nodes + 1))
+  ami_id = var.aws_image_id == "" || var.aws_image_id == "latest" ? data.aws_ami_ids.rubrik_cloud_cluster.ids[0] : var.aws_image_id
+  sg_ids = var.aws_cloud_cluster_nodes_sg_ids == "" ? [module.rubrik_nodes_sg.security_group_id] : concat(var.aws_cloud_cluster_nodes_sg_ids, [module.rubrik_nodes_sg.security_group_id])
   cluster_node_config = {
     "instance_type"           = var.aws_instance_type,
-    "ami_id"                  = data.aws_ami_ids.rubrik_cloud_cluster.ids[0],
-    "sg_ids"                  = concat(var.aws_cloud_cluster_nodes_sg_ids, [module.rubrik_nodes_sg.security_group_id]),
+    "ami_id"                  = local.ami_id,
+    "sg_ids"                  = local.sg_ids,
     "subnet_id"               = var.aws_subnet_id,
     "key_pair_name"           = local.aws_key_pair_name,
     "disable_api_termination" = var.aws_disable_api_termination,
@@ -25,7 +26,21 @@ locals {
       "type"     = var.cluster_disk_type
     }
   }
-  cluster_tag = var.environment_tag == "" ? local.cluster_name : "${var.environment_tag}:${local.cluster_name}"
+  create_key_pair = var.create_key_pair ? 1 : 0
+}
+
+# RSA key of size 4096 bits
+resource "tls_private_key" "cc-key" {
+  count = local.create_key_pair
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "local_file" "cc-key-file" {
+  count = local.create_key_pair
+  content = tls_private_key.cc-key[0].private_key_pem
+  filename = var.private-key-file
+  file_permission = "400"
 }
 
 data "aws_subnet" "rubrik_cloud_cluster" {
@@ -52,8 +67,8 @@ data "aws_ami_ids" "rubrik_cloud_cluster" {
 module "aws_key_pair" {
   source = "terraform-aws-modules/key-pair/aws"
 
-  key_name        = var.aws_key_pair_name == "" ? "${local.cluster_name}.key-pair" : var.aws_key_pair_name
-  public_key      = var.aws_public_key
+  key_name        = var.aws_key_pair_name == "" ? "${var.cluster_name}.key-pair" : var.aws_key_pair_name
+  public_key      = var.aws_public_key == "" ? tls_private_key.cc-key[0].public_key_openssh : var.aws_public_key
   create_key_pair = var.create_key_pair
 }
 
@@ -70,13 +85,12 @@ module "s3_vpc_endpoint" {
 
   create = var.create_s3_vpc_endpoint
   vpc_id = data.aws_subnet.rubrik_cloud_cluster.vpc_id
-  #route_table_ids = [data.aws_vpc.rubrik_cloud_cluster.main_route_table_id]
-  #endpoint_name = (var.s3_vpc_endpoint_name == "" ? "${local.cluster_name}.vpc-ep" : var.s3_vpc_endpoint_name)
-  tags = merge(
+  
+  tags =  merge(
+    { Name = "${var.cluster_name}:ep" },
     var.aws_tags
   )
 }
-
 
 ######################################################################
 # Create, then configure, the Security Groups for the Rubrik Cluster #
@@ -85,23 +99,24 @@ module "rubrik_nodes_sg" {
   source = "terraform-aws-modules/security-group/aws"
 
   use_name_prefix = true
-  name            = var.aws_vpc_cloud_cluster_nodes_sg_name == "" ? "${local.cluster_name}.sg" : var.aws_vpc_cloud_cluster_nodes_sg_name
+  name            = var.aws_vpc_cloud_cluster_nodes_sg_name == "" ? "${var.cluster_name}.sg" : var.aws_vpc_cloud_cluster_nodes_sg_name
   description     = "Allow hosts to talk to Rubrik Cloud Cluster and Cluster to talk to itself"
   vpc_id          = data.aws_subnet.rubrik_cloud_cluster.vpc_id
-  create          = var.create_aws_rubrik_hosts_sg
+  create          = var.create_cloud_cluster_hosts_sg
   tags = merge(
-    { name = "${local.cluster_tag}:sg" },
+    { name = "${var.cluster_name}:sg" },
     var.aws_tags
   )
 }
 
 module "rubrik_nodes_sg_rules" {
-  source             = "./modules/rubrik_nodes_sg"
-  sg_id              = module.rubrik_nodes_sg.security_group_id
-  rubrik_hosts_sg_id = module.rubrik_hosts_sg.security_group_id
-  create             = var.create_aws_rubrik_hosts_sg
+  source                          = "./modules/rubrik_nodes_sg"
+  sg_id                           = module.rubrik_nodes_sg.security_group_id
+  rubrik_hosts_sg_id              = module.rubrik_hosts_sg.security_group_id
+  create                          = var.create_cloud_cluster_hosts_sg
+  cloud_cluster_nodes_admin_cidr  = var.cloud_cluster_nodes_admin_cidr 
   tags = merge(
-    { name = "${local.cluster_tag}:sg-rule" },
+    { name = "${var.cluster_name}:sg-rule" },
     var.aws_tags
   )
   depends_on = [
@@ -113,12 +128,12 @@ module "rubrik_hosts_sg" {
   source = "terraform-aws-modules/security-group/aws"
 
   use_name_prefix = true
-  name            = var.aws_vpc_cloud_cluster_nodes_sg_name == "" ? "${local.cluster_name}.sg" : var.aws_vpc_cloud_cluster_nodes_sg_name
+  name            = var.aws_vpc_cloud_cluster_hosts_sg_name == "" ? "${var.cluster_name}.sg" : var.aws_vpc_cloud_cluster_hosts_sg_name
   description     = "Allow Rubrik Cloud Cluster to talk to hosts, and hosts with this security group can talk to cluster"
   vpc_id          = data.aws_subnet.rubrik_cloud_cluster.vpc_id
-  create          = var.create_aws_rubrik_hosts_sg
+  create          = var.create_cloud_cluster_hosts_sg
   tags = merge(
-    { name = "${local.cluster_tag}:sg" },
+    { name = "${var.cluster_name}:sg" },
     var.aws_tags
   )
 }
@@ -128,9 +143,9 @@ module "rubrik_hosts_sg_rules" {
 
   sg_id              = module.rubrik_hosts_sg.security_group_id
   rubrik_nodes_sg_id = module.rubrik_nodes_sg.security_group_id
-  create             = var.create_aws_rubrik_hosts_sg
+  create             = var.create_cloud_cluster_hosts_sg
   tags = merge(
-    { name = "${local.cluster_tag}:sg-rule" },
+    { name = "${var.cluster_name}:sg-rule" },
     var.aws_tags
   )
   depends_on = [
@@ -146,7 +161,7 @@ module "s3_bucket" {
   source = "terraform-aws-modules/s3-bucket/aws"
 
   create_bucket = var.create_s3_bucket
-  bucket = (var.s3_bucket_name == "" ? "${local.cluster_name}.bucket-do-not-delete" : var.s3_bucket_name)
+  bucket = var.s3_bucket_name == "" ? "${var.cluster_name}.bucket-do-not-delete" : var.s3_bucket_name
   acl    = "private"
 }
 
@@ -156,11 +171,11 @@ module "s3_bucket" {
 module "iam_role" {
   source = "./modules/iam_role"
 
-  bucket                = module.s3_bucket.s3_bucket_id
+  bucket                = module.s3_bucket
   create                = var.create_iam_role
-  role_name             = var.aws_cloud_cluster_iam_role_name == "" ? "${local.cluster_name}.role" : var.aws_cloud_cluster_iam_role_name
-  role_policy_name      = var.aws_cloud_cluster_iam_role_policy_name == "" ? "${local.cluster_name}.role-policy" : var.aws_cloud_cluster_iam_role_policy_name
-  instance_profile_name = var.aws_cloud_cluster_ec2_instance_profile_name == "" ? "${local.cluster_name}.instance-profile" : var.aws_cloud_cluster_ec2_instance_profile_name
+  role_name             = var.aws_cloud_cluster_iam_role_name == "" ? "${var.cluster_name}.role" : var.aws_cloud_cluster_iam_role_name
+  role_policy_name      = var.aws_cloud_cluster_iam_role_policy_name == "" ? "${var.cluster_name}.role-policy" : var.aws_cloud_cluster_iam_role_policy_name
+  instance_profile_name = var.aws_cloud_cluster_ec2_instance_profile_name == "" ? "${var.cluster_name}.instance-profile" : var.aws_cloud_cluster_ec2_instance_profile_name
 }
 
 ###############################

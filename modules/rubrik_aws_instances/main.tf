@@ -1,25 +1,3 @@
-variable "node_names" {
-  type = set(string)
-}
-
-variable "node_config" {
-  type = object({
-    instance_type = string
-    ami_id  = string
-    sg_ids = set(string)
-    subnet_id = string
-    key_pair_name = string
-    disable_api_termination = bool
-    iam_instance_profile = string
-    availability_zone = string
-    tags = map(string)
-  })
-}
-
-variable "disks" {
-  type = map(any)
-}
-
 resource "aws_instance" "rubrik_cluster" {
   for_each = var.node_names
   instance_type = var.node_config.instance_type
@@ -27,7 +5,9 @@ resource "aws_instance" "rubrik_cluster" {
   vpc_security_group_ids = var.node_config.sg_ids
   subnet_id = var.node_config.subnet_id
   key_name  = var.node_config.key_pair_name
-
+  lifecycle {
+    ignore_changes = [ami]
+  }
   tags = merge({
     Name = each.value },
     var.node_config.tags
@@ -37,6 +17,7 @@ resource "aws_instance" "rubrik_cluster" {
   iam_instance_profile    = var.node_config.iam_instance_profile
   root_block_device {
     encrypted = true
+    tags = {Name = "${each.value}-sda"}
   }
 
 }
